@@ -63,10 +63,10 @@ def fused_linear_cross_entropy_forward(
     if input_requires_grad:
         if accum_dtype is None:
             grad_weight = torch.zeros_like(weight, device=device) if weight.requires_grad else None
-            grad_bias = torch.zeros_like(bias, device=device) if bias is not None else None
+            grad_bias = torch.zeros_like(bias, device=device) if bias is not None and bias.requires_grad else None
         else:
             grad_weight = torch.zeros_like(weight, dtype=accum_dtype, device=device) if weight.requires_grad else None
-            grad_bias = torch.zeros_like(bias, dtype=accum_dtype, device=device) if bias is not None else None
+            grad_bias = torch.zeros_like(bias, dtype=accum_dtype, device=device) if bias is not None and bias.requires_grad else None
     else:
         grad_weight = None
         grad_bias = None
@@ -211,7 +211,7 @@ def fused_linear_cross_entropy_forward(
         if grad_weight is not None and input_requires_grad:
             grad_weight += torch.mm(grad_logits_chunk.t(), _input_chunk).float()
 
-        if bias is not None and input_requires_grad:
+        if grad_bias is not None:
             torch.add(
                 input=grad_bias,
                 other=grad_logits_chunk.sum(dim=0),
@@ -390,7 +390,7 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
         ctx.save_for_backward(
             grad_input.detach(),
             grad_weight.detach() if grad_weight is not None else None,
-            grad_bias.detach() if bias is not None else None,
+            grad_bias.detach() if grad_bias is not None else None,
         )
         ctx.return_z_loss = return_z_loss
         ctx.return_token_accuracy = return_token_accuracy
