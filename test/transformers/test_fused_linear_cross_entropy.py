@@ -1022,3 +1022,142 @@ def test_correctness_with_predicted_tokens(B, T, H, V, reduction, dtype, bias, i
     # Verify backward still works
     result.loss.backward()
     assert _input.grad is not None
+
+
+#############################################################################
+# Tests for reduction="none" backward with per-token grad_output
+#############################################################################
+
+
+@pytest.mark.parametrize(
+    "B, T, H, V",
+    [
+        (2, 4, 8, 16),
+        (4, 47, 31, 123),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_correctness_reduction_none_backward_frozen_weight(B, T, H, V, dtype):
+    """Test that reduction='none' backward with per-token weighting produces correct
+    grad_input when lm_head weight is frozen (PPO/RL-style use case)."""
+    atol = 1e-4 if dtype == torch.float32 else 5e-2
+    rtol = 1e-4 if dtype == torch.float32 else 5e-2
+
+    weight = torch.randn(V, H, device=device, dtype=dtype)
+    _input_base = torch.randn(B * T, H, device=device, dtype=dtype)
+
+    target = torch.randint(0, V, (B * T,), device=device, dtype=torch.long)
+
+    # --- Torch reference (unfused) ---
+    x_ref = _input_base.detach().clone().requires_grad_(True)
+    logits = x_ref @ weight.t()
+    loss_per_token = torch.nn.functional.cross_entropy(
+        logits.float(), target, reduction="none"
+    )
+    # Simulate PPO-style per-token weighting
+    per_token_weights = torch.rand(B * T, device=device, dtype=dtype)
+    weighted_loss = (loss_per_token * per_token_weights).sum()
+    weighted_loss.backward()
+    ref_grad_input = x_ref.grad.clone()
+
+    # --- Liger fused ---
+    x_liger = _input_base.detach().clone().requires_grad_(True)
+    liger_loss = liger_fused_linear_cross_entropy(
+        input=x_liger,
+        weight=weight,
+        target=target,
+        reduction="none",
+    )
+    liger_weighted_loss = (liger_loss * per_token_weights).sum()
+    liger_weighted_loss.backward()
+    liger_grad_input = x_liger.grad.clone()
+
+    cos_sim = torch.nn.functional.cosine_similarity(
+        ref_grad_input.flatten().float(), liger_grad_input.flatten().float(), dim=0
+    )
+    assert cos_sim > 0.99, f"Cosine similarity too low: {cos_sim}"
+    assert_verbose_allclose(ref_grad_input, liger_grad_input, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize(
+    "B, T, H, V",
+    [
+        (2, 4, 8, 16),
+    ],
+)
+def test_reduction_none_backward_raises_for_trainable_weight(B, T, H, V):
+    """Test that reduction='none' backward raises RuntimeError when grad_weight
+    is needed (i.e., weight requires grad)."""
+    dtype = torch.float32
+    weight = torch.randn(V, H, device=device, dtype=dtype, requires_grad=True)
+    _input = torch.randn(B * T, H, device=device, dtype=dtype, requires_grad=True)
+    target = torch.randint(0, V, (B * T,), device=device, dtype=torch.long)
+
+    # Use the autograd Function directly so weight grad flows through
+    loss, _, _, _ = LigerFusedLinearCrossEntropyFunction.apply(
+        _input, weight, target, None, None, -100, 0.0, 0.0, "none", None, False, None, False, False, False
+    )
+    per_token_weights = torch.rand(B * T, device=device, dtype=dtype)
+    weighted_loss = (loss * per_token_weights).sum()
+
+    with pytest.raises(RuntimeError, match="cannot correctly compute grad_weight"):
+        weighted_loss.backward()
+
+
+@pytest.mark.parametrize(
+    "B, T, H, V",
+    [
+        (2, 4, 8, 16),
+    ],
+)
+def test_reduction_none_backward_raises_for_trainable_bias(B, T, H, V):
+    """Test that reduction='none' backward raises RuntimeError when grad_bias
+    is needed (i.e., bias is provided and weight is frozen but bias needs grad)."""
+    dtype = torch.float32
+    weight = torch.randn(V, H, device=device, dtype=dtype)  # frozen
+    bias = torch.randn(V, device=device, dtype=dtype, requires_grad=True)
+    _input = torch.randn(B * T, H, device=device, dtype=dtype, requires_grad=True)
+    target = torch.randint(0, V, (B * T,), device=device, dtype=torch.long)
+
+    loss, _, _, _ = LigerFusedLinearCrossEntropyFunction.apply(
+        _input, weight, target, bias, None, -100, 0.0, 0.0, "none", None, False, None, False, False, False
+    )
+    per_token_weights = torch.rand(B * T, device=device, dtype=dtype)
+    weighted_loss = (loss * per_token_weights).sum()
+
+    with pytest.raises(RuntimeError, match="cannot correctly compute grad_bias"):
+        weighted_loss.backward()
+
+
+@pytest.mark.parametrize(
+    "B, T, H, V",
+    [
+        (2, 4, 8, 16),
+        (4, 47, 31, 123),
+    ],
+)
+def test_reduction_none_to_sum_backward(B, T, H, V):
+    """Test that reduction='none' followed by .sum() gives same gradients
+    as reduction='sum' (scalar grad_output path)."""
+    dtype = torch.float32
+    atol, rtol = 1e-4, 1e-4
+
+    weight = torch.randn(V, H, device=device, dtype=dtype)
+    _input_base = torch.randn(B * T, H, device=device, dtype=dtype)
+    target = torch.randint(0, V, (B * T,), device=device, dtype=torch.long)
+
+    # reduction='sum' path (scalar grad_output)
+    x_sum = _input_base.detach().clone().requires_grad_(True)
+    loss_sum = liger_fused_linear_cross_entropy(
+        input=x_sum, weight=weight, target=target, reduction="sum",
+    )
+    loss_sum.backward()
+
+    # reduction='none' then .sum() (vector grad_output)
+    x_none = _input_base.detach().clone().requires_grad_(True)
+    loss_none = liger_fused_linear_cross_entropy(
+        input=x_none, weight=weight, target=target, reduction="none",
+    )
+    loss_none.sum().backward()
+
+    assert_verbose_allclose(x_sum.grad, x_none.grad, atol=atol, rtol=rtol)

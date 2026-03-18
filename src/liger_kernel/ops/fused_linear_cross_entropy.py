@@ -247,47 +247,76 @@ def fused_linear_cross_entropy_forward(
 def fused_linear_cross_entropy_backward(grad_output, grad_input, grad_weight, grad_bias):
     # If cross entropy is the last layer, grad_output is 1.0. Skip the mul to save time
     if not torch.equal(grad_output, torch.tensor(1.0, device=grad_output.device)):
-        # We use a Triton kernel instead of a PyTorch operation because modifying inputs in-place
-        # for gradient storage and backward multiple times causes anomalies with PyTorch but not with Triton.
-        BT, H = grad_input.shape
-        n_rows = BT
-        BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(H))
+        # Check if grad_output is a per-token vector (reduction="none") vs scalar
+        is_vector_grad = grad_output.dim() >= 1 and grad_output.numel() > 1
 
-        element_mul_kernel[(n_rows,)](
-            grad_input,
-            grad_input.stride(-2),
-            grad_output,
-            H,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=32 if not is_hip() else 16,
-        )
+        if is_vector_grad:
+            # Per-token grad_output from reduction="none".
+            # grad_input [BT, H] can be correctly scaled per-row.
+            grad_input.mul_(grad_output.view(-1, 1))
 
-        # handle grad_weight
-        if grad_weight is not None:
-            V, H = grad_weight.shape
-            n_rows = V
+            # grad_weight [V, H] and grad_bias [V] were accumulated across all tokens
+            # during forward (Σ_i dlogits_i^T @ input_i), so per-token reweighting
+            # cannot be applied retroactively. Raise if they require gradients.
+            if grad_weight is not None:
+                raise RuntimeError(
+                    "LigerFusedLinearCrossEntropyLoss backward with per-token "
+                    "grad_output (reduction='none') cannot correctly compute "
+                    "grad_weight because it was accumulated across all tokens "
+                    "during forward. Either freeze the linear weight (e.g. lm_head) "
+                    "or use a non-fused cross-entropy loss."
+                )
+            if grad_bias is not None:
+                raise RuntimeError(
+                    "LigerFusedLinearCrossEntropyLoss backward with per-token "
+                    "grad_output (reduction='none') cannot correctly compute "
+                    "grad_bias because it was accumulated across all tokens "
+                    "during forward. Either freeze the bias or use a non-fused "
+                    "cross-entropy loss."
+                )
+        else:
+            # Scalar grad_output — original Triton kernel path
+            # We use a Triton kernel instead of a PyTorch operation because modifying inputs in-place
+            # for gradient storage and backward multiple times causes anomalies with PyTorch but not with Triton.
+            BT, H = grad_input.shape
+            n_rows = BT
+            BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(H))
 
             element_mul_kernel[(n_rows,)](
-                grad_weight,
-                grad_weight.stride(-2),
+                grad_input,
+                grad_input.stride(-2),
                 grad_output,
                 H,
                 BLOCK_SIZE=BLOCK_SIZE,
                 num_warps=32 if not is_hip() else 16,
             )
 
-        if grad_bias is not None:
-            V = grad_bias.shape[0]
-            n_rows = V
+            # handle grad_weight
+            if grad_weight is not None:
+                V, H = grad_weight.shape
+                n_rows = V
 
-            element_mul_kernel[(n_rows,)](
-                grad_bias,
-                grad_bias.stride(-1),
-                grad_output,
-                1,
-                BLOCK_SIZE=BLOCK_SIZE,
-                num_warps=32 if not is_hip() else 16,
-            )
+                element_mul_kernel[(n_rows,)](
+                    grad_weight,
+                    grad_weight.stride(-2),
+                    grad_output,
+                    H,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                    num_warps=32 if not is_hip() else 16,
+                )
+
+            if grad_bias is not None:
+                V = grad_bias.shape[0]
+                n_rows = V
+
+                element_mul_kernel[(n_rows,)](
+                    grad_bias,
+                    grad_bias.stride(-1),
+                    grad_output,
+                    1,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                    num_warps=32 if not is_hip() else 16,
+                )
     return grad_input, grad_weight, grad_bias
 
 
