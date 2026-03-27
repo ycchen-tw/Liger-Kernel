@@ -30,6 +30,7 @@ def fused_linear_cross_entropy_forward(
     use_token_scaling=False,
     return_token_accuracy=False,
     return_predicted_tokens=False,
+    return_entropy=False,
 ):
     assert isinstance(return_z_loss, bool), f"return_z_loss must be True or False. Got: {return_z_loss}"
     assert isinstance(return_token_accuracy, bool), (
@@ -75,6 +76,7 @@ def fused_linear_cross_entropy_forward(
     z_loss_1d = torch.zeros(BT, dtype=_input.dtype, device=_input.device) if return_z_loss else None
     token_accuracy_1d = torch.zeros(BT, dtype=torch.float32, device=device) if return_token_accuracy else None
     predicted_tokens_1d = torch.full((BT,), -1, dtype=torch.int64, device=device) if return_predicted_tokens else None
+    entropy_1d = torch.zeros(BT, dtype=torch.float32, device=device) if return_entropy else None
 
     # TODO: evaluate how CUDA synchronization caused by .item() affects the speed
     target_mask = target != ignore_index
@@ -136,6 +138,15 @@ def fused_linear_cross_entropy_forward(
 
             # Store the scaling factors
             scaling_factors = pred_probs.detach()  # Detach to ensure no gradient flow
+
+        # Compute entropy from logits BEFORE the triton kernel modifies them in-place.
+        # H(p) = logsumexp(logits) - sum(softmax(logits) * logits)
+        # No backward needed — entropy is for logging only.
+        if return_entropy:
+            logits_f = logits_chunk.float()
+            lse = torch.logsumexp(logits_f, dim=-1)
+            probs = torch.softmax(logits_f, dim=-1)
+            entropy_1d[start_idx:end_idx] = lse - (probs * logits_f).sum(-1)
 
         # unreduced loss
         loss_1d_slice = loss_1d[start_idx:end_idx]  # chunk_size,
@@ -241,7 +252,7 @@ def fused_linear_cross_entropy_forward(
     grad_weight = grad_weight.to(weight.dtype) if grad_weight is not None else None
     grad_bias = grad_bias.to(bias.dtype) if grad_bias is not None else None
 
-    return loss, z_loss, token_accuracy, predicted_tokens, grad_input, grad_weight, grad_bias
+    return loss, z_loss, token_accuracy, predicted_tokens, entropy_1d, grad_input, grad_weight, grad_bias
 
 
 def fused_linear_cross_entropy_backward(grad_output, grad_input, grad_weight, grad_bias):
@@ -340,6 +351,7 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
         use_token_scaling: bool = False,
         return_token_accuracy: bool = False,
         return_predicted_tokens: bool = False,
+        return_entropy: bool = False,
     ):
         """
         Fusing the last linear layer with cross-entropy loss
@@ -367,7 +379,7 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
         return_predicted_tokens (bool): When `return_predicted_tokens` is `True`, returns per-token predicted class indices (argmax) without materializing logits. Default: `False`
         """
 
-        loss, z_loss, token_accuracy, predicted_tokens, grad_input, grad_weight, grad_bias = (
+        loss, z_loss, token_accuracy, predicted_tokens, entropy, grad_input, grad_weight, grad_bias = (
             fused_linear_cross_entropy_forward(
                 _input=_input,
                 weight=weight,
@@ -384,6 +396,7 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
                 use_token_scaling=use_token_scaling,
                 return_token_accuracy=return_token_accuracy,
                 return_predicted_tokens=return_predicted_tokens,
+                return_entropy=return_entropy,
             )
         )
         # downcast to dtype and store for backward
@@ -395,17 +408,20 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
         ctx.return_z_loss = return_z_loss
         ctx.return_token_accuracy = return_token_accuracy
         ctx.return_predicted_tokens = return_predicted_tokens
-        return loss, z_loss, token_accuracy, predicted_tokens
+        ctx.return_entropy = return_entropy
+        return loss, z_loss, token_accuracy, predicted_tokens, entropy
 
     @staticmethod
     @amp_custom_bwd
-    def backward(ctx, grad_output, grad_output2, grad_output3, grad_output4):
+    def backward(ctx, grad_output, grad_output2, grad_output3, grad_output4, grad_output5):
         if ctx.return_z_loss:
             del grad_output2  # z_loss is only for logging
         if ctx.return_token_accuracy:
             del grad_output3  # token_accuracy is only for metrics
         if ctx.return_predicted_tokens:
             del grad_output4  # predicted_tokens is only for metrics
+        if ctx.return_entropy:
+            del grad_output5  # entropy is only for logging
         (grad_input, grad_weight, grad_bias) = ctx.saved_tensors
         grad_input, grad_weight, grad_bias = fused_linear_cross_entropy_backward(
             grad_output, grad_input, grad_weight, grad_bias
@@ -426,4 +442,5 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
             None,  # use_token_scaling
             None,  # return_token_accuracy
             None,  # return_predicted_tokens
+            None,  # return_entropy
         )

@@ -34,6 +34,7 @@ class CrossEntropyOutput:
     z_loss: Optional[torch.Tensor] = None
     token_accuracy: Optional[torch.Tensor] = None
     predicted_tokens: Optional[torch.Tensor] = None
+    entropy: Optional[torch.Tensor] = None
 
 
 # conform to the function signature in https://pytorch.org/docs/stable/generated/torch.nn.functional.cross_entropy.html
@@ -91,8 +92,9 @@ def liger_fused_linear_cross_entropy(
     use_token_scaling: bool = False,
     return_token_accuracy: bool = False,
     return_predicted_tokens: bool = False,
+    return_entropy: bool = False,
 ):
-    loss, z_loss, token_accuracy, predicted_tokens = LigerFusedLinearCrossEntropyFunction.apply(
+    loss, z_loss, token_accuracy, predicted_tokens, entropy = LigerFusedLinearCrossEntropyFunction.apply(
         input,
         weight,
         target,
@@ -108,13 +110,20 @@ def liger_fused_linear_cross_entropy(
         use_token_scaling,
         return_token_accuracy,
         return_predicted_tokens,
+        return_entropy,
     )
 
-    if not return_z_loss and not return_token_accuracy and not return_predicted_tokens:
+    if (
+        not return_z_loss
+        and not return_token_accuracy
+        and not return_predicted_tokens
+        and not return_entropy
+    ):
         return loss
 
     return CrossEntropyOutput(
-        loss=loss, z_loss=z_loss, token_accuracy=token_accuracy, predicted_tokens=predicted_tokens
+        loss=loss, z_loss=z_loss, token_accuracy=token_accuracy,
+        predicted_tokens=predicted_tokens, entropy=entropy,
     )
 
 
